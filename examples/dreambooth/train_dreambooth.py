@@ -1,5 +1,6 @@
 import argparse
 import hashlib
+import inspect
 import itertools
 import random
 import json
@@ -34,6 +35,13 @@ logger = get_logger(__name__)
 
 def parse_args(input_args=None):
     parser = argparse.ArgumentParser(description="Simple example of a training script.")
+    parser.add_argument(
+        "--attention",
+        type=str,
+        choices=["xformers", "flash_attention"],
+        default="xformers",
+        help="Type of attention to use."
+    )
     parser.add_argument(
         "--pretrained_model_name_or_path",
         type=str,
@@ -85,10 +93,10 @@ def parse_args(input_args=None):
         help="The prompt to specify images in the same class as provided instance images.",
     )
     parser.add_argument(
-        "--save_sample_prompt",
+        '--add_sample_prompt',
         type=str,
-        default=None,
-        help="The prompt used to generate sample outputs to save.",
+        action='append',
+        help='Append to the list of sample prompts'
     )
     parser.add_argument(
         "--save_sample_negative_prompt",
@@ -472,7 +480,11 @@ def main(args):
                     for example in tqdm(
                         sample_dataloader, desc="Generating class images", disable=not accelerator.is_local_main_process
                     ):
-                        images = pipeline(example["prompt"]).images
+                        images = pipeline(
+                            example["prompt"],
+                            height=args.resolution,
+                            width =args.resolution
+                        ).images
 
                         for i, image in enumerate(images):
                             hash_image = hashlib.sha1(image.tobytes()).hexdigest()
@@ -513,6 +525,19 @@ def main(args):
         revision=args.revision,
         torch_dtype=torch.float32
     )
+
+#    if is_xformers_available() and args.attention=='xformers':
+    if args.attention=='xformers':
+        try:
+            unet.enable_xformers_memory_efficient_attention()
+            vae.enable_xformers_memory_efficient_attention()
+        except Exception as e:
+            logger.warning(
+                "Could not enable memory efficient attention. Make sure xformers is installed"
+                f" correctly and a GPU is available: {e}"
+            )
+    elif args.attention=='flash_attention':
+        tu.replace_unet_cross_attn_to_flash_attention()
 
     vae.requires_grad_(False)
     if not args.train_text_encoder:
@@ -678,14 +703,24 @@ def main(args):
     def save_weights(step):
         # Create the pipeline using using the trained modules and save it.
         if accelerator.is_main_process:
+            # newer versions of accelerate allow the 'keep_fp32_wrapper' arg. without passing
+            # it, the models will be unwrapped, and when they are then used for further training,
+            # we will crash. pass this, but only to newer versions of accelerate. fixes
+            # https://github.com/huggingface/diffusers/issues/1566
+            accepts_keep_fp32_wrapper = "keep_fp32_wrapper" in set(
+                inspect.signature(accelerator.unwrap_model).parameters.keys()
+            )
+            extra_args = {"keep_fp32_wrapper": True} if accepts_keep_fp32_wrapper else {}
+
             if args.train_text_encoder:
-                text_enc_model = accelerator.unwrap_model(text_encoder)
+                text_enc_model = accelerator.unwrap_model(text_encoder, **extra_args)
             else:
                 text_enc_model = CLIPTextModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="text_encoder", revision=args.revision)
             scheduler = DDIMScheduler(beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear", clip_sample=False, set_alpha_to_one=False)
+
             pipeline = StableDiffusionPipeline.from_pretrained(
                 args.pretrained_model_name_or_path,
-                unet=accelerator.unwrap_model(unet),
+                unet=accelerator.unwrap_model(unet, **extra_args),
                 text_encoder=text_enc_model,
                 vae=AutoencoderKL.from_pretrained(
                     args.pretrained_vae_name_or_path or args.pretrained_model_name_or_path,
@@ -698,29 +733,42 @@ def main(args):
                 revision=args.revision,
             )
             save_dir = os.path.join(args.output_dir, f"{step}")
-            pipeline.save_pretrained(save_dir)
+            os.makedirs(save_dir, exist_ok=True)
+
+            # TEMPORARY: Only save when done or every 4th save_interval
+            if global_step >= args.max_train_steps or global_step % (4 * args.save_interval) == 0:
+                pipeline.save_pretrained(save_dir)
+
             with open(os.path.join(save_dir, "args.json"), "w") as f:
                 json.dump(args.__dict__, f, indent=2)
 
-            if args.save_sample_prompt is not None:
+            if args.add_sample_prompt:
+                h = 0
                 pipeline = pipeline.to(accelerator.device)
-                g_cuda = torch.Generator(device=accelerator.device).manual_seed(args.seed)
                 pipeline.set_progress_bar_config(disable=True)
                 sample_dir = os.path.join(save_dir, "samples")
                 os.makedirs(sample_dir, exist_ok=True)
-                with torch.autocast("cuda"), torch.inference_mode():
-                    for i in tqdm(range(args.n_save_sample), desc="Generating samples"):
-                        images = pipeline(
-                            args.save_sample_prompt,
-                            negative_prompt=args.save_sample_negative_prompt,
-                            guidance_scale=args.save_guidance_scale,
-                            num_inference_steps=args.save_infer_steps,
-                            generator=g_cuda
-                        ).images
-                        images[0].save(os.path.join(sample_dir, f"{i}.png"))
+
+                for sample_prompt in args.add_sample_prompt:
+                    g_cuda = torch.Generator(device=accelerator.device).manual_seed(args.seed)
+                    with torch.autocast("cuda"), torch.inference_mode():
+                        for i in tqdm(range(args.n_save_sample), desc="Generating samples"):
+                            images = pipeline(
+                                sample_prompt,
+                                negative_prompt=args.save_sample_negative_prompt,
+                                height=args.resolution,
+                                width =args.resolution,
+                                guidance_scale=args.save_guidance_scale,
+                                num_inference_steps=args.save_infer_steps,
+                                generator=g_cuda
+                            ).images
+                            images[0].save(os.path.join(sample_dir, f"{h}{i}.png"))
+                    h = h + 1
+
                 del pipeline
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
+
             print(f"[*] Weights saved at {save_dir}")
 
     # Only show the progress bar once on each machine.
